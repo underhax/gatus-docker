@@ -1,0 +1,48 @@
+# Documentation: https://gatus.io/docs
+
+storage:
+  type: sqlite
+  path: /data/data.db
+  caching: true
+  maximum-number-of-results: 8640
+  maximum-number-of-events: 100
+
+web:
+  port: 8080
+
+alerting:
+  ntfy:
+    url: "${GATUS_NTFY_URL}"
+    token: "${GATUS_NTFY_TOKEN}"
+    topic: "${GATUS_NTFY_TOPIC}"
+    priority: 3
+
+# endpoints:
+#   - name: Core Portal (HEAD + SSL Expiration)
+#     group: core-services
+#     url: "https://example.com"
+#     method: HEAD
+#     interval: 1m
+#     conditions:
+#       - "[STATUS] == 200"
+#       - "[CERTIFICATE_EXPIRATION] > 600h"
+#       - "[RESPONSE_TIME] < 500"
+#     alerts:
+#       - type: ntfy
+#         failure-threshold: 3
+#         success-threshold: 1
+#         send-on-resolved: true
+#         minimum-reminder-interval: 72h
+#
+#   - name: Root Domain Registration Expiration (RDAP/WHOIS Check)
+#     group: domain-monitoring
+#     url: "https://example.com"
+#     interval: 24h
+#     conditions:
+#       - "[DOMAIN_EXPIRATION] > 720h"
+#     alerts:
+#       - type: ntfy
+#         failure-threshold: 1
+#         success-threshold: 1
+#         send-on-resolved: true
+#         minimum-reminder-interval: 120h

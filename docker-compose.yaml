@@ -1,0 +1,61 @@
+name: gatus
+
+services:
+  gatus:
+    image: ghcr.io/underhax/gatus-docker:${GATUS_VERSION:-latest}
+    container_name: gatus
+    restart: always
+    user: "${APP_UID}:${APP_GID}"
+    read_only: true
+    ipc: none
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add: []
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+          pids: 50
+    mem_reservation: 64M
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,nodev,size=64m
+    volumes:
+      - ./config:/config:ro,noexec,nosuid,nodev
+      - ./data:/data:rw,noexec,nosuid,nodev
+      - /etc/localtime:/etc/localtime:ro
+    secrets:
+      - gatus_ntfy_url
+      - gatus_ntfy_topic
+      - gatus_ntfy_token
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/probe"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${HOST_PORT:-54080}:8080"
+    # networks:
+    #   - frontend_gateway
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  gatus_ntfy_url:
+    file: ./secrets/gatus_ntfy_url
+  gatus_ntfy_topic:
+    file: ./secrets/gatus_ntfy_topic
+  gatus_ntfy_token:
+    file: ./secrets/gatus_ntfy_token
+
+# networks:
+#   frontend_gateway:
+#     external: true
