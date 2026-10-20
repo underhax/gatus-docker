@@ -8,13 +8,17 @@ COPY go.mod ./
 COPY init/ ./init/
 COPY probe/ ./probe/
 
-RUN mkdir -p /out/data && \
+RUN mkdir -p /out/data /out/etc/ssl/certs && \
+    chmod 0755 /out/etc /out/etc/ssl /out/etc/ssl/certs && \
+    chmod 0700 /out/data && \
+    cp /etc/ssl/certs/ca-certificates.crt /out/etc/ssl/certs/ca-certificates.crt && \
+    chmod 0444 /out/etc/ssl/certs/ca-certificates.crt && \
     CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o /out/init ./init && \
     CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o /out/probe ./probe
 
 FROM scratch
 
-COPY --from=go-builder --chmod=0444 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=go-builder /out/etc /etc
 COPY --from=donor --chmod=0555 /gatus /gatus
 COPY --from=donor --chmod=0444 /config/config.yaml /config/config.yaml
 COPY --from=go-builder --chmod=0555 /out/init /usr/local/bin/init
