@@ -1,4 +1,4 @@
-# Documentation: https://gatus.io/docs
+# Documentation: https://github.com/TwiN/gatus#table-of-contents
 
 storage:
   type: sqlite
@@ -10,39 +10,90 @@ storage:
 web:
   port: 8080
 
-alerting:
-  ntfy:
-    url: "${GATUS_NTFY_URL}"
-    token: "${GATUS_NTFY_TOKEN}"
-    topic: "${GATUS_NTFY_TOPIC}"
-    priority: 3
+# ui:
+#   title: "Service Status"
+#   header: "Services Status"
+#   dashboard-heading: "Health Dashboard"
+#   dashboard-subheading: "Monitoring from ${GATUS_LOCATION}"
+#   default-sort-by: "group"
+#   logo: "https://example.com/logo.png"
+#   link: "https://example.com"
+#   buttons:
+#     - name: "Portal"
+#       url: "https://example.com"
+#   custom-css: |
+#     footer { display: none !important; }
+
+security:
+  basic:
+    username: "${GATUS_DASHBOARD_USER}"
+    password-bcrypt-base64: "${GATUS_DASHBOARD_PASS}"
+
+# alerting:
+#   ntfy:
+#     url: "${GATUS_NTFY_URL}"
+#     token: "${GATUS_NTFY_TOKEN}"
+#     topic: "${GATUS_NTFY_TOPIC}"
+#     priority: 4
+#     default-alert:
+#       description: "Source: ${GATUS_LOCATION}"
+#   matrix:
+#     server-url: "${GATUS_MATRIX_SERVER_URL}"
+#     access-token: "${GATUS_MATRIX_ACCESS_TOKEN}"
+#     internal-room-id: "${GATUS_MATRIX_ROOM}"
+#     default-alert:
+#       description: "Source: ${GATUS_LOCATION}"
 
 # endpoints:
-#   - name: Core Portal (HEAD + SSL Expiration)
-#     group: core-services
+#   - name: example.com
+#     group: "Server 1"
 #     url: "https://example.com"
 #     method: HEAD
 #     interval: 1m
 #     conditions:
 #       - "[STATUS] == 200"
-#       - "[CERTIFICATE_EXPIRATION] > 600h"
-#       - "[RESPONSE_TIME] < 500"
+#       - "[RESPONSE_TIME] < 1000"
 #     alerts:
 #       - type: ntfy
 #         failure-threshold: 3
 #         success-threshold: 1
 #         send-on-resolved: true
-#         minimum-reminder-interval: 72h
 #
-#   - name: Root Domain Registration Expiration (RDAP/WHOIS Check)
-#     group: domain-monitoring
+#   # Endpoint with HTTP Basic Authentication and Matrix alerts
+#   - name: secure.example.com
+#     group: "Server 1"
+#     url: "https://secure.example.com"
+#     method: HEAD
+#     headers:
+#       Authorization: "Basic ${GATUS_ENDPOINT_AUTH_TOKEN}"
+#     interval: 1m
+#     conditions:
+#       - "[STATUS] == 200"
+#       - "[RESPONSE_TIME] < 1000"
+#     alerts:
+#       - type: matrix
+#         failure-threshold: 2
+#         success-threshold: 1
+#         send-on-resolved: true
+#
+#   - name: example.com
+#     group: "Expiration"
 #     url: "https://example.com"
+#     method: HEAD
 #     interval: 24h
 #     conditions:
 #       - "[DOMAIN_EXPIRATION] > 720h"
+#       - "[CERTIFICATE_EXPIRATION] > 600h"
 #     alerts:
 #       - type: ntfy
 #         failure-threshold: 1
 #         success-threshold: 1
 #         send-on-resolved: true
-#         minimum-reminder-interval: 120h
+#         minimum-reminder-interval: 72h
+#         provider-override:
+#           priority: 3
+#       - type: matrix
+#         failure-threshold: 1
+#         success-threshold: 1
+#         send-on-resolved: true
+#         minimum-reminder-interval: 72h

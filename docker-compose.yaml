@@ -29,9 +29,11 @@ services:
       - ./data:/data:rw,noexec,nosuid,nodev
       - /etc/localtime:/etc/localtime:ro
     secrets:
-      - gatus_ntfy_url
-      - gatus_ntfy_topic
-      - gatus_ntfy_token
+      - gatus_dashboard_user
+      - gatus_dashboard_pass
+      # - gatus_ntfy_url
+      # - gatus_ntfy_topic
+      # - gatus_ntfy_token
     healthcheck:
       test: ["CMD", "/usr/local/bin/probe"]
       interval: 30s
@@ -49,12 +51,16 @@ services:
         max-file: "3"
 
 secrets:
-  gatus_ntfy_url:
-    file: ./secrets/gatus_ntfy_url
-  gatus_ntfy_topic:
-    file: ./secrets/gatus_ntfy_topic
-  gatus_ntfy_token:
-    file: ./secrets/gatus_ntfy_token
+  gatus_dashboard_user:
+    file: ./secrets/gatus_dashboard_user
+  gatus_dashboard_pass:
+    file: ./secrets/gatus_dashboard_pass
+  # gatus_ntfy_url:
+  #   file: ./secrets/gatus_ntfy_url
+  # gatus_ntfy_topic:
+  #   file: ./secrets/gatus_ntfy_topic
+  # gatus_ntfy_token:
+  #   file: ./secrets/gatus_ntfy_token
 
 # networks:
 #   frontend_gateway:
