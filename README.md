@@ -1,7 +1,6 @@
 # Hardened Containerized Gatus
 
 [![CI](https://github.com/underhax/gatus-docker/actions/workflows/ci.yml/badge.svg)](https://github.com/underhax/gatus-docker/actions/workflows/ci.yml)
-[![Build](https://github.com/underhax/gatus-docker/actions/workflows/build.yml/badge.svg)](https://github.com/underhax/gatus-docker/actions/workflows/build.yml)
 [![GitHub last commit](https://img.shields.io/github/last-commit/underhax/gatus-docker)](https://github.com/underhax/gatus-docker/commits/main)
 [![GitHub issues](https://img.shields.io/github/issues/underhax/gatus-docker)](https://github.com/underhax/gatus-docker/issues)
 [![GitHub repo size](https://img.shields.io/github/repo-size/underhax/gatus-docker)](https://github.com/underhax/gatus-docker)

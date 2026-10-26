@@ -36,13 +36,13 @@ security:
 #     topic: "${GATUS_NTFY_TOPIC}"
 #     priority: 4
 #     default-alert:
-#       description: "Source: ${GATUS_LOCATION}"
+#       description: "${GATUS_LOCATION}"
 #   matrix:
 #     server-url: "${GATUS_MATRIX_SERVER_URL}"
 #     access-token: "${GATUS_MATRIX_ACCESS_TOKEN}"
 #     internal-room-id: "${GATUS_MATRIX_ROOM}"
 #     default-alert:
-#       description: "Source: ${GATUS_LOCATION}"
+#       description: "${GATUS_LOCATION}"
 
 # endpoints:
 #   - name: example.com
