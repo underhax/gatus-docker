@@ -5,13 +5,40 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
+
+var (
+	errMockExec     = errors.New("simulated execution failure")
+	errMockReadDir  = errors.New("simulated readdir failure")
+	errMockReadFile = errors.New("simulated readfile failure")
+	errMockDial     = errors.New("simulated dial failure")
+	errMockClose    = errors.New("simulated close failure")
+	errMockOpen     = errors.New("simulated open failure")
+	errMockWrite    = errors.New("simulated write failure")
+	errMockScrub    = errors.New("simulated scrub failure")
+)
+
+var (
+	recordedExitCode     = -1
+	capturedArgs         []string
+	capturedEnv          []string
+	mockDialAttemptCount int
+	mockProcDirectory    string
+)
+
+func mockExitRecorder(code int) {
+	recordedExitCode = code
+}
 
 func mockFailingReadDir(_ string) ([]fs.DirEntry, error) {
 	return nil, errMockReadDir
@@ -33,20 +60,110 @@ func mockSuccessfulCommand(ctx context.Context, _ []string) *exec.Cmd {
 	return exec.CommandContext(ctx, "true")
 }
 
+func mockFailingCommand(ctx context.Context, _ []string) *exec.Cmd {
+	return exec.CommandContext(ctx, "false")
+}
+
+func mockNonExistentCommand(ctx context.Context, _ []string) *exec.Cmd {
+	return exec.CommandContext(ctx, "/path/that/does/not/exist")
+}
+
 func mockTerminatedExec(ctx context.Context, _, _ []string) error {
 	return exec.CommandContext(ctx, "sh", "-c", "kill -TERM $$").Run()
 }
 
-var recordedExitCode = -1
-
-func mockExitRecorder(code int) {
-	recordedExitCode = code
+func mockFailingScrub(_ context.Context, _ int) error {
+	return errMockScrub
 }
 
-var (
-	capturedArgs []string
-	capturedEnv  []string
-)
+type mockSocketDialer struct {
+	err  error
+	conn net.Conn
+}
+
+func (m *mockSocketDialer) DialContext(_ context.Context, _, _ string) (net.Conn, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.conn, nil
+}
+
+var activeMockDialer = &mockSocketDialer{}
+
+func mockCreateDialer() socketDialer {
+	return activeMockDialer
+}
+
+type mockSuccessConn struct {
+	net.Conn
+}
+
+func (m *mockSuccessConn) Close() error {
+	return nil
+}
+
+func mockSuccessDialTCP(_ context.Context, _, _ string) (net.Conn, error) {
+	return &mockSuccessConn{}, nil
+}
+
+func mockFailingDialTCP(_ context.Context, _, _ string) (net.Conn, error) {
+	return nil, errMockDial
+}
+
+type mockErrorCloserConn struct {
+	net.Conn
+}
+
+func (m *mockErrorCloserConn) Close() error {
+	return errMockClose
+}
+
+func mockErrorCloserDialTCP(_ context.Context, _, _ string) (net.Conn, error) {
+	return &mockErrorCloserConn{}, nil
+}
+
+func mockRetrySuccessDialTCP(_ context.Context, _, _ string) (net.Conn, error) {
+	mockDialAttemptCount++
+	if mockDialAttemptCount == 1 {
+		return nil, errMockDial
+	}
+	return &mockSuccessConn{}, nil
+}
+
+func mockProcPath(pid int, entry string) string {
+	if mockProcDirectory != "" {
+		return filepath.Join(mockProcDirectory, strconv.Itoa(pid), entry)
+	}
+	return defaultProcPath(pid, entry)
+}
+
+func mockFailingOpenFile(_ string, _ int, _ os.FileMode) (*os.File, error) {
+	return nil, errMockOpen
+}
+
+func mockPermissionOpenFile(_ string, _ int, _ os.FileMode) (*os.File, error) {
+	return nil, os.ErrPermission
+}
+
+func mockPermissionReadFile(_ string) ([]byte, error) {
+	return nil, os.ErrPermission
+}
+
+func mockFailingWriteMemory(_ *os.File, _ []byte, _ int64) (int, error) {
+	return 0, errMockWrite
+}
+
+func mockPermissionWriteMemory(_ *os.File, _ []byte, _ int64) (int, error) {
+	return 0, os.ErrPermission
+}
+
+func mockFailingCloseFile(_ *os.File) error {
+	return errMockClose
+}
+
+func mockPermissionCloseFile(_ *os.File) error {
+	return os.ErrPermission
+}
 
 func mockRecordingExec(_ context.Context, args, env []string) error {
 	capturedArgs = args
@@ -56,6 +173,77 @@ func mockRecordingExec(_ context.Context, args, env []string) error {
 
 func mockNotExistReadDir(_ string) ([]fs.DirEntry, error) {
 	return nil, fs.ErrNotExist
+}
+
+func makeStatContent(comm, envStart, envEnd string, fieldCount int) string {
+	var sb strings.Builder
+	sb.WriteString("1234 (")
+	sb.WriteString(comm)
+	sb.WriteString(")")
+	for i := range fieldCount {
+		sb.WriteString(" ")
+		switch i {
+		case statEnvStartIndex:
+			sb.WriteString(envStart)
+		case statEnvEndIndex:
+			sb.WriteString(envEnd)
+		default:
+			sb.WriteString("0")
+		}
+	}
+	return sb.String()
+}
+
+func setupScrubChildFixture(t *testing.T) (pid int, statPath, memPath string) {
+	t.Helper()
+	tempDir := t.TempDir()
+	pid = 4242
+	pidDir := filepath.Join(tempDir, strconv.Itoa(pid))
+	if err := os.Mkdir(pidDir, 0o750); err != nil {
+		t.Fatalf("creating pid dir: %v", err)
+	}
+
+	statFilePath := filepath.Join(pidDir, "stat")
+	memFilePath := filepath.Join(pidDir, "mem")
+
+	validStatData := makeStatContent("gatus", "10", "20", 49)
+	if err := os.WriteFile(filepath.Clean(statFilePath), []byte(validStatData), 0o600); err != nil {
+		t.Fatalf("writing stat file: %v", err)
+	}
+
+	initialMem := make([]byte, 30)
+	for i := range initialMem {
+		initialMem[i] = byte(i + 1)
+	}
+	if err := os.WriteFile(filepath.Clean(memFilePath), initialMem, 0o600); err != nil {
+		t.Fatalf("writing mem file: %v", err)
+	}
+
+	mockProcDirectory = tempDir
+	procPath = mockProcPath
+	return pid, statFilePath, memFilePath
+}
+
+func setupScrubCleanup(t *testing.T) {
+	t.Helper()
+	origProcPath := procPath
+	origReadFile := readFile
+	origOpenFile := openFile
+	origWriteMem := writeMemory
+	origCloseFile := closeFile
+	origDialTCP := dialTCP
+
+	dialTCP = mockSuccessDialTCP
+
+	t.Cleanup(func() {
+		procPath = origProcPath
+		readFile = origReadFile
+		openFile = origOpenFile
+		writeMemory = origWriteMem
+		closeFile = origCloseFile
+		dialTCP = origDialTCP
+		mockProcDirectory = ""
+	})
 }
 
 func TestDefaultReadFile(t *testing.T) {
@@ -99,6 +287,351 @@ func TestDefaultReadDir(t *testing.T) {
 
 	if _, err := defaultReadDir(filepath.Join(tempDir, "missing_subdir")); err == nil {
 		t.Error("defaultReadDir() expected error on nonexistent directory, got nil")
+	}
+}
+
+func TestDefaultCloseFile(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "close_test.txt")
+	file, err := os.Create(filepath.Clean(filePath))
+	if err != nil {
+		t.Fatalf("creating test file: %v", err)
+	}
+
+	if err := defaultCloseFile(file); err != nil {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+
+	if err := defaultCloseFile(file); err == nil {
+		t.Fatal("expected error closing already closed file, got nil")
+	}
+}
+
+func TestDefaultWriteMemory(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "mem.bin")
+	cleanPath := filepath.Clean(filePath)
+	file, err := os.OpenFile(cleanPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("creating test file: %v", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Errorf("closing file: %v", closeErr)
+		}
+	}()
+
+	n, err := defaultWriteMemory(file, []byte("payload"), 0)
+	if err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if n != 7 {
+		t.Fatalf("expected 7 bytes written, got %d", n)
+	}
+
+	readOnlyFile, err := os.OpenFile(cleanPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("opening read-only file: %v", err)
+	}
+	defer func() {
+		if closeErr := readOnlyFile.Close(); closeErr != nil {
+			t.Errorf("closing read-only file: %v", closeErr)
+		}
+	}()
+
+	if _, err := defaultWriteMemory(readOnlyFile, []byte("data"), 0); err == nil {
+		t.Fatal("expected write error on read-only file, got nil")
+	}
+}
+
+func TestDefaultOpenFile(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "open_test.txt")
+	cleanPath := filepath.Clean(filePath)
+	if err := os.WriteFile(cleanPath, []byte("sample"), 0o600); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+
+	file, err := defaultOpenFile(cleanPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("unexpected open error: %v", err)
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		t.Fatalf("closing file: %v", closeErr)
+	}
+
+	if _, err := defaultOpenFile(filepath.Join(tempDir, "missing_test.txt"), os.O_RDONLY, 0); err == nil {
+		t.Fatal("expected error opening missing file, got nil")
+	}
+}
+
+func TestDefaultCreateDialer(t *testing.T) {
+	d := defaultCreateDialer()
+	if d == nil {
+		t.Fatal("expected non-nil dialer, got nil")
+	}
+}
+
+func TestDefaultDialTCP(t *testing.T) {
+	origDialer := createDialer
+	createDialer = mockCreateDialer
+	t.Cleanup(func() { createDialer = origDialer })
+
+	activeMockDialer.err = errMockDial
+	activeMockDialer.conn = nil
+	if _, err := defaultDialTCP(context.Background(), "tcp", "127.0.0.1:9091"); err == nil {
+		t.Fatal("expected dial error, got nil")
+	}
+
+	activeMockDialer.err = nil
+	activeMockDialer.conn = &mockSuccessConn{}
+	conn, err := defaultDialTCP(context.Background(), "tcp", "127.0.0.1:9092")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("expected non-nil conn, got nil")
+	}
+}
+
+func TestDefaultProcPath(t *testing.T) {
+	got := defaultProcPath(42, "stat")
+	expected := filepath.Join(defaultProcDir, "42", "stat")
+	if got != expected {
+		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestParseProcStat(t *testing.T) {
+	tests := []struct {
+		name         string
+		statContent  string
+		wantEnvStart int64
+		wantEnvEnd   int64
+		expectErr    bool
+	}{
+		{
+			name:        "missing_closing_comm_paren",
+			statContent: "1234 gatus 0 0 0",
+			expectErr:   true,
+		},
+		{
+			name:        "insufficient_fields_after_comm",
+			statContent: makeStatContent("gatus", "100", "200", 20),
+			expectErr:   true,
+		},
+		{
+			name:        "invalid_env_start_non_number",
+			statContent: makeStatContent("gatus", "not_a_number", "200", 49),
+			expectErr:   true,
+		},
+		{
+			name:        "invalid_env_end_non_number",
+			statContent: makeStatContent("gatus", "100", "not_a_number", 49),
+			expectErr:   true,
+		},
+		{
+			name:        "negative_or_zero_env_start",
+			statContent: makeStatContent("gatus", "0", "200", 49),
+			expectErr:   true,
+		},
+		{
+			name:        "env_start_greater_than_env_end",
+			statContent: makeStatContent("gatus", "300", "200", 49),
+			expectErr:   true,
+		},
+		{
+			name:        "env_range_exceeds_max_limit",
+			statContent: makeStatContent("gatus", "1000", "34554433", 49),
+			expectErr:   true,
+		},
+		{
+			name:         "valid_stat_with_nested_comm",
+			statContent:  makeStatContent("gatus (worker) proc", "1000", "2000", 49),
+			wantEnvStart: 1000,
+			wantEnvEnd:   2000,
+			expectErr:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			envStart, envEnd, err := parseProcStat(tt.statContent)
+			if tt.expectErr {
+				if err == nil {
+					t.Fatalf("expected error for case %q, got nil", tt.name)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for case %q: %v", tt.name, err)
+			}
+			if envStart != tt.wantEnvStart || envEnd != tt.wantEnvEnd {
+				t.Fatalf("expected (%d, %d), got (%d, %d)", tt.wantEnvStart, tt.wantEnvEnd, envStart, envEnd)
+			}
+		})
+	}
+}
+
+func TestWaitForChildReadiness(t *testing.T) {
+	origDial := dialTCP
+	t.Cleanup(func() { dialTCP = origDial })
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForChildReadiness(canceledCtx, "127.0.0.1:8080", time.Second); err == nil {
+		t.Fatal("expected error on canceled context, got nil")
+	}
+
+	dialTCP = mockSuccessDialTCP
+	if err := waitForChildReadiness(context.Background(), "127.0.0.1:8081", time.Second); err != nil {
+		t.Fatalf("unexpected error on ready socket: %v", err)
+	}
+
+	dialTCP = mockErrorCloserDialTCP
+	if err := waitForChildReadiness(context.Background(), "127.0.0.1:8082", time.Second); err == nil {
+		t.Fatal("expected error when socket close fails, got nil")
+	}
+
+	dialTCP = mockFailingDialTCP
+	if err := waitForChildReadiness(context.Background(), "127.0.0.1:8083", -1*time.Second); err != nil {
+		t.Fatalf("expected nil when deadline passed, got %v", err)
+	}
+
+	ctxWait, cancelWait := context.WithCancel(context.Background())
+	time.AfterFunc(2*time.Millisecond, cancelWait)
+	if err := waitForChildReadiness(ctxWait, "127.0.0.1:8084", 2*time.Second); err == nil {
+		t.Fatal("expected error when context canceled during wait, got nil")
+	}
+
+	mockDialAttemptCount = 0
+	dialTCP = mockRetrySuccessDialTCP
+	if err := waitForChildReadiness(context.Background(), "127.0.0.1:8085", time.Second); err != nil {
+		t.Fatalf("unexpected error on retry dial: %v", err)
+	}
+}
+
+func TestDefaultScrubChildMemory_ReadinessErrors(t *testing.T) {
+	setupScrubCleanup(t)
+	pid, _, _ := setupScrubChildFixture(t)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := defaultScrubChildMemory(canceledCtx, pid); err != nil {
+		t.Fatalf("expected nil when readiness context canceled, got %v", err)
+	}
+
+	dialTCP = mockErrorCloserDialTCP
+	if err := defaultScrubChildMemory(context.Background(), pid); err == nil {
+		t.Fatal("expected error on readiness failure, got nil")
+	}
+}
+
+func TestDefaultScrubChildMemory_ReadAndParseErrors(t *testing.T) {
+	setupScrubCleanup(t)
+	pid, statFilePath, _ := setupScrubChildFixture(t)
+
+	if err := defaultScrubChildMemory(context.Background(), 9999); err != nil {
+		t.Fatalf("expected nil when stat file missing, got %v", err)
+	}
+
+	readFile = mockPermissionReadFile
+	if err := defaultScrubChildMemory(context.Background(), pid); err != nil {
+		t.Fatalf("expected nil on stat read permission error, got %v", err)
+	}
+
+	readFile = mockFailingReadFile
+	if err := defaultScrubChildMemory(context.Background(), pid); err == nil {
+		t.Fatal("expected error on generic stat read error, got nil")
+	}
+	readFile = defaultReadFile
+
+	if err := os.WriteFile(filepath.Clean(statFilePath), []byte("corrupt stat data"), 0o600); err != nil {
+		t.Fatalf("overwriting stat: %v", err)
+	}
+	if err := defaultScrubChildMemory(context.Background(), pid); err == nil {
+		t.Fatal("expected error on corrupt stat data, got nil")
+	}
+}
+
+func TestDefaultScrubChildMemory_OpenErrors(t *testing.T) {
+	setupScrubCleanup(t)
+	pid, _, memFilePath := setupScrubChildFixture(t)
+
+	if err := os.Remove(filepath.Clean(memFilePath)); err != nil {
+		t.Fatalf("removing mem file: %v", err)
+	}
+	if err := defaultScrubChildMemory(context.Background(), pid); err != nil {
+		t.Fatalf("expected nil when mem file missing, got %v", err)
+	}
+
+	openFile = mockPermissionOpenFile
+	if err := defaultScrubChildMemory(context.Background(), pid); err != nil {
+		t.Fatalf("expected nil on mem open permission error, got %v", err)
+	}
+
+	openFile = mockFailingOpenFile
+	if err := defaultScrubChildMemory(context.Background(), pid); err == nil {
+		t.Fatal("expected error on generic mem open error, got nil")
+	}
+}
+
+func TestDefaultScrubChildMemory_WriteErrors(t *testing.T) {
+	setupScrubCleanup(t)
+	pid, _, _ := setupScrubChildFixture(t)
+
+	writeMemory = mockPermissionWriteMemory
+	if err := defaultScrubChildMemory(context.Background(), pid); err != nil {
+		t.Fatalf("expected nil on mem write permission error, got %v", err)
+	}
+
+	writeMemory = mockFailingWriteMemory
+	if err := defaultScrubChildMemory(context.Background(), pid); err == nil {
+		t.Fatal("expected error on generic mem write error, got nil")
+	}
+}
+
+func TestDefaultScrubChildMemory_CloseErrors(t *testing.T) {
+	setupScrubCleanup(t)
+	pid, _, _ := setupScrubChildFixture(t)
+
+	closeFile = mockPermissionCloseFile
+	if err := defaultScrubChildMemory(context.Background(), pid); err != nil {
+		t.Fatalf("expected nil on mem close permission error, got %v", err)
+	}
+
+	closeFile = mockFailingCloseFile
+	if err := defaultScrubChildMemory(context.Background(), pid); err == nil {
+		t.Fatal("expected error on generic mem close error, got nil")
+	}
+}
+
+func TestDefaultScrubChildMemory_Success(t *testing.T) {
+	setupScrubCleanup(t)
+	pid, _, memFilePath := setupScrubChildFixture(t)
+
+	if err := defaultScrubChildMemory(context.Background(), pid); err != nil {
+		t.Fatalf("unexpected error on successful scrub: %v", err)
+	}
+
+	scrubbedData, err := os.ReadFile(filepath.Clean(memFilePath))
+	if err != nil {
+		t.Fatalf("reading scrubbed mem file: %v", err)
+	}
+	for i := range 10 {
+		if scrubbedData[i] != byte(i+1) {
+			t.Fatalf("expected untouched byte at %d, got %d", i, scrubbedData[i])
+		}
+	}
+	for i := 10; i < 20; i++ {
+		if scrubbedData[i] != 0 {
+			t.Fatalf("expected zeroed byte at %d, got %d", i, scrubbedData[i])
+		}
+	}
+	for i := 20; i < 30; i++ {
+		if scrubbedData[i] != byte(i+1) {
+			t.Fatalf("expected untouched byte at %d, got %d", i, scrubbedData[i])
+		}
 	}
 }
 
@@ -165,41 +698,33 @@ func TestDefaultCreateCommand(t *testing.T) {
 }
 
 func TestDefaultExec(t *testing.T) {
-	origCreateCommand := createCommand
-	defer func() { createCommand = origCreateCommand }()
-
 	ctx := context.Background()
+	origCreate := createCommand
+	origScrub := scrubChildMemory
+	t.Cleanup(func() {
+		createCommand = origCreate
+		scrubChildMemory = origScrub
+	})
 
-	tests := []struct {
-		cmdFunc     func(context.Context, []string) *exec.Cmd
-		name        string
-		expectError bool
-	}{
-		{
-			name:        "successful execution",
-			cmdFunc:     mockSuccessfulCommand,
-			expectError: false,
-		},
-		{
-			name: "missing binary execution failure",
-			cmdFunc: func(ctx context.Context, _ []string) *exec.Cmd {
-				return exec.CommandContext(ctx, "/path/that/does/not/exist")
-			},
-			expectError: true,
-		},
+	createCommand = mockNonExistentCommand
+	if err := defaultExec(ctx, nil, nil); err == nil {
+		t.Fatal("expected error executing non-existent binary, got nil")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			createCommand = tt.cmdFunc
-			err := defaultExec(ctx, []string{"test"}, []string{"FOO=BAR"})
-			if tt.expectError && err == nil {
-				t.Errorf("defaultExec() expected error, got nil")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("defaultExec() unexpected error: %v", err)
-			}
-		})
+	createCommand = mockFailingCommand
+	if err := defaultExec(ctx, nil, nil); err == nil {
+		t.Fatal("expected error when command exits with failure, got nil")
+	}
+
+	createCommand = mockSuccessfulCommand
+	scrubChildMemory = mockFailingScrub
+	if err := defaultExec(ctx, nil, nil); err != nil {
+		t.Fatalf("unexpected error executing true binary with failing scrub: %v", err)
+	}
+
+	scrubChildMemory = defaultScrubChildMemory
+	if err := defaultExec(ctx, []string{"test"}, []string{"FOO=BAR"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

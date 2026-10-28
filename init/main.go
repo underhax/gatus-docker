@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,11 +28,20 @@ const (
 	secretPrefix      = "gatus_"
 )
 
+const (
+	defaultLoopbackAddress  = "127.0.0.1"
+	defaultServerPort       = "8080"
+	defaultProcDir          = "/proc"
+	defaultReadinessTimeout = 30 * time.Second
+	childReadinessInterval  = 50 * time.Millisecond
+	maxEnvRangeSize         = 32 * 1024 * 1024
+	minStatFieldsAfterComm  = 49
+	statEnvStartIndex       = 47
+	statEnvEndIndex         = 48
+)
+
 var (
 	errInvalidSecretKey = errors.New("invalid characters in secret environment key")
-	errMockExec         = errors.New("simulated execution failure")
-	errMockReadDir      = errors.New("simulated readdir failure")
-	errMockReadFile     = errors.New("simulated readfile failure")
 )
 
 func defaultReadFile(path string) ([]byte, error) {
@@ -48,6 +60,51 @@ func defaultReadDir(dirname string) ([]fs.DirEntry, error) {
 		return nil, fmt.Errorf("reading secrets directory %q: %w", cleanDir, err)
 	}
 	return entries, nil
+}
+
+func defaultCloseFile(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing file: %w", err)
+	}
+	return nil
+}
+
+func defaultWriteMemory(f *os.File, b []byte, off int64) (int, error) {
+	n, err := f.WriteAt(b, off)
+	if err != nil {
+		return n, fmt.Errorf("writing memory: %w", err)
+	}
+	return n, nil
+}
+
+func defaultOpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	cleanPath := filepath.Clean(name)
+	file, err := os.OpenFile(cleanPath, flag, perm)
+	if err != nil {
+		return nil, fmt.Errorf("opening file %q: %w", cleanPath, err)
+	}
+	return file, nil
+}
+
+type socketDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+func defaultCreateDialer() socketDialer {
+	return &net.Dialer{}
+}
+
+func defaultDialTCP(ctx context.Context, network, address string) (net.Conn, error) {
+	d := createDialer()
+	conn, err := d.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, fmt.Errorf("dialing %s %s: %w", network, address, err)
+	}
+	return conn, nil
+}
+
+func defaultProcPath(pid int, entry string) string {
+	return filepath.Join(defaultProcDir, strconv.Itoa(pid), entry)
 }
 
 func cancelCommand(cmd *exec.Cmd) func() error {
@@ -69,6 +126,118 @@ func defaultCreateCommand(ctx context.Context, args []string) *exec.Cmd {
 	return cmd
 }
 
+func parseProcStat(statContent string) (envStart, envEnd int64, err error) {
+	_, remainder, found := strings.CutLast(statContent, ")")
+	if !found {
+		return 0, 0, errors.New("missing closing parenthesis for comm in stat content")
+	}
+
+	fields := strings.Fields(remainder)
+	if len(fields) < minStatFieldsAfterComm {
+		return 0, 0, fmt.Errorf("stat fields count %d below required minimum %d", len(fields), minStatFieldsAfterComm)
+	}
+
+	envStart, err = strconv.ParseInt(fields[statEnvStartIndex], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parsing env_start from stat: %w", err)
+	}
+
+	envEnd, err = strconv.ParseInt(fields[statEnvEndIndex], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parsing env_end from stat: %w", err)
+	}
+
+	if envStart <= 0 || envEnd <= envStart {
+		return 0, 0, fmt.Errorf("invalid environment boundaries: env_start (%d) >= env_end (%d)", envStart, envEnd)
+	}
+
+	if envEnd-envStart > maxEnvRangeSize {
+		return 0, 0, fmt.Errorf("environment range size %d exceeds limit of %d bytes", envEnd-envStart, maxEnvRangeSize)
+	}
+
+	return envStart, envEnd, nil
+}
+
+func waitForChildReadiness(ctx context.Context, addr string, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("readiness context canceled: %w", err)
+		}
+		conn, err := dialTCP(waitCtx, "tcp", addr)
+		if err == nil {
+			if closeErr := conn.Close(); closeErr != nil {
+				return fmt.Errorf("closing readiness socket: %w", closeErr)
+			}
+			return nil
+		}
+		timer := time.NewTimer(childReadinessInterval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				return nil
+			}
+			return fmt.Errorf("readiness context canceled: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func isIgnorableMemoryError(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission)
+}
+
+func defaultScrubChildMemory(ctx context.Context, pid int) (err error) {
+	targetAddr := net.JoinHostPort(defaultLoopbackAddress, defaultServerPort)
+	if readinessErr := waitForChildReadiness(ctx, targetAddr, defaultReadinessTimeout); readinessErr != nil {
+		if isIgnorableMemoryError(readinessErr) || errors.Is(readinessErr, context.Canceled) {
+			return nil
+		}
+		return fmt.Errorf("synchronizing child readiness: %w", readinessErr)
+	}
+
+	statPath := procPath(pid, "stat")
+	statBytes, readErr := readFile(statPath)
+	if readErr != nil {
+		if isIgnorableMemoryError(readErr) {
+			return nil
+		}
+		return fmt.Errorf("reading stat file %q: %w", statPath, readErr)
+	}
+
+	envStart, envEnd, parseErr := parseProcStat(string(statBytes))
+	if parseErr != nil {
+		return fmt.Errorf("parsing stat file %q: %w", statPath, parseErr)
+	}
+
+	memPath := procPath(pid, "mem")
+	memFile, openErr := openFile(memPath, os.O_RDWR, 0)
+	if openErr != nil {
+		if isIgnorableMemoryError(openErr) {
+			return nil
+		}
+		return fmt.Errorf("opening mem file %q: %w", memPath, openErr)
+	}
+	defer func() {
+		if closeErr := closeFile(memFile); closeErr != nil && err == nil && !isIgnorableMemoryError(closeErr) {
+			err = fmt.Errorf("closing mem file %q: %w", memPath, closeErr)
+		}
+	}()
+
+	zeros := make([]byte, envEnd-envStart)
+	if _, writeErr := writeMemory(memFile, zeros, envStart); writeErr != nil {
+		if isIgnorableMemoryError(writeErr) {
+			return nil
+		}
+		return fmt.Errorf("zeroing memory in %q: %w", memPath, writeErr)
+	}
+
+	return nil
+}
+
 func defaultExec(ctx context.Context, args, env []string) error {
 	cmd := createCommand(ctx, args)
 	cmd.Env = env
@@ -76,18 +245,49 @@ func defaultExec(ctx context.Context, args, env []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("running target binary: %w", err)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting target binary %q: %w", defaultBinaryPath, err)
+	}
+
+	pid := cmd.Process.Pid
+	scrubCtx, cancelScrub := context.WithCancel(ctx)
+	defer cancelScrub()
+
+	scrubDone := make(chan struct{})
+	go func() {
+		defer close(scrubDone)
+		if scrubErr := scrubChildMemory(scrubCtx, pid); scrubErr != nil {
+			fmt.Fprintf(os.Stderr, "memory scrubbing failed: %v\n", scrubErr)
+		}
+	}()
+
+	cmd.Env = nil
+	clear(env)
+	runtime.GC()
+
+	waitErr := cmd.Wait()
+	cancelScrub()
+	<-scrubDone
+
+	if waitErr != nil {
+		return fmt.Errorf("running target binary: %w", waitErr)
 	}
 	return nil
 }
 
 var (
-	createCommand = defaultCreateCommand
-	execProcess   = defaultExec
-	exitFunc      = os.Exit
-	readDir       = defaultReadDir
-	readFile      = defaultReadFile
+	closeFile        = defaultCloseFile
+	createCommand    = defaultCreateCommand
+	createDialer     = defaultCreateDialer
+	dialTCP          = defaultDialTCP
+	execProcess      = defaultExec
+	exitFunc         = os.Exit
+	openFile         = defaultOpenFile
+	procPath         = defaultProcPath
+	readDir          = defaultReadDir
+	readFile         = defaultReadFile
+	scrubChildMemory = defaultScrubChildMemory
+	writeMemory      = defaultWriteMemory
 )
 
 // PrepareEnvironment scans the specified secrets directory for files matching
@@ -126,6 +326,7 @@ func PrepareEnvironment(baseEnv []string, secretsDir string) ([]string, error) {
 		}
 
 		val := strings.TrimSpace(string(data))
+		clear(data)
 		if val == "" {
 			continue
 		}
