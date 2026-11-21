@@ -2,7 +2,7 @@ name: gatus
 
 services:
   gatus:
-    image: ghcr.io/underhax/gatus-docker:${GATUS_VERSION:-latest}
+    image: ghcr.io/underhax/gatus:${GATUS_VERSION:-latest}
     container_name: gatus
     restart: always
     user: "${APP_UID}:${APP_GID}"
